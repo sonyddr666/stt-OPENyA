@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 # stt-config-ok.py
 #
-# STT continuo por turnos, sem API key, sem token.txt e sem cookies.
-# Agora transcreve LOCALMENTE usando faster-whisper.
+# STT CONFIG OK: continuo por turnos com configuracao aprovada:
+# - microfone fica SEMPRE ouvindo
+# - 1s de silencio fecha um turno
+# - turno fechado entra numa fila
+# - worker transcreve em paralelo, sem pausar a captura
+# - imprime e salva em transcricao.txt na ordem
+# - v3: nao corta por tempo, filtra teclado com start debounce e cooldown apos ruido curto
+#
+# CONFIG OK validada no teste:
+#   --threshold 260 --continue-threshold 220 --start-required-ms 80
+#   --continue-required-ms 90 --min-speech-ms 250 --silence-ms 800
+#   --discard-cooldown-ms 250
+#
+# Resultado observado: pegou fala curta como "ruim", frases longas e contagem ate 50,
+# com microfone sempre ouvindo e transcricao em fila.
 #
 # Instalar:
-#   pip install sounddevice numpy faster-whisper
+#   pip install sounddevice numpy curl_cffi
 #
 # Rodar:
 #   python stt-config-ok.py
-#   python stt-config-ok.py --model small
 #   python stt-config-ok.py --threshold 360
 #   python stt-config-ok.py --silence-ms 1000 --threshold 260
 
@@ -18,23 +30,137 @@ from __future__ import annotations
 import argparse
 import audioop
 import collections
+import json
 import os
 import queue
+import re
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from dataclasses import dataclass
+from typing import Any
 
 import sounddevice as sd
-from faster_whisper import WhisperModel
+from curl_cffi import requests as cf_requests
 
+TOKEN_FILE = "token.txt"
 OUTPUT_FILE = "transcricao.txt"
+URL = "https://chatgpt.com/backend-api/transcribe"
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_MS = 30
 SAMPLE_WIDTH = 2
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/145.0.0.0 Safari/537.36"
+)
+
+
+# ============================================================
+# TOKEN / HEADERS
+# ============================================================
+
+def parse_devtools_block(texto: str) -> dict[str, str]:
+    linhas = [l.rstrip() for l in texto.strip().splitlines()]
+    headers: dict[str, str] = {}
+    i = 0
+
+    while i < len(linhas):
+        linha = linhas[i].strip()
+
+        if not linha:
+            i += 1
+            continue
+
+        if linha in (":method", ":path", ":scheme", ":authority"):
+            i += 2
+            continue
+
+        if i == 0 and "." in linha and " " not in linha:
+            i += 1
+            continue
+
+        eh_chave = bool(re.match(r"^[a-z0-9:][a-z0-9\-]*$", linha.lower()))
+
+        if eh_chave and i + 1 < len(linhas):
+            valor = linhas[i + 1].strip()
+            proximo_eh_chave = bool(re.match(r"^[a-z0-9:][a-z0-9\-]*$", valor.lower()))
+            if not proximo_eh_chave:
+                headers[linha.lower()] = valor
+                i += 2
+                continue
+
+        if ": " in linha:
+            k, _, v = linha.partition(": ")
+            headers[k.strip().lower()] = v.strip()
+
+        i += 1
+
+    return headers
+
+
+def extrair_credenciais(texto: str) -> tuple[dict[str, str], list[str]]:
+    headers = parse_devtools_block(texto)
+    dados = {
+        "authorization": headers.get("authorization", ""),
+        "cookie": headers.get("cookie", ""),
+        "chatgpt-account-id": headers.get("chatgpt-account-id", ""),
+        "oai-device-id": headers.get("oai-device-id", ""),
+        "oai-language": headers.get("oai-language", "pt-BR"),
+    }
+    erros: list[str] = []
+    if not dados["authorization"]:
+        erros.append("Nao encontrei authorization.")
+    if not dados["cookie"]:
+        erros.append("Nao encontrei cookie.")
+    return dados, erros
+
+
+def carregar_token_txt() -> dict[str, str]:
+    if not os.path.exists(TOKEN_FILE):
+        return {}
+    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {str(k): str(v) for k, v in data.items() if v is not None}
+
+
+def salvar_token_txt(dados: dict[str, str]) -> None:
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+
+
+def importar_headers_interativo() -> dict[str, str] | None:
+    print("\nCole os Request Headers do DevTools. Quando terminar, digite FIM.\n")
+    linhas: list[str] = []
+    while True:
+        linha = input()
+        if linha.strip().upper() == "FIM":
+            break
+        linhas.append(linha)
+
+    dados, erros = extrair_credenciais("\n".join(linhas))
+    if erros:
+        print("\n".join(erros))
+        print("Nao deu pra salvar. Copie os headers completos.")
+        return None
+
+    salvar_token_txt(dados)
+    print("\nCredenciais salvas em token.txt")
+    print("Bearer:", dados.get("authorization", "")[:50] + "...")
+    print("Cookie:", dados.get("cookie", "")[:60] + "...")
+    return dados
+
+
+def garantir_token() -> dict[str, str] | None:
+    dados = carregar_token_txt()
+    if dados.get("authorization") and dados.get("cookie"):
+        return dados
+    return importar_headers_interativo()
 
 
 # ============================================================
@@ -93,7 +219,7 @@ class TranscriptStore:
 
 
 # ============================================================
-# WHISPER LOCAL
+# TRANSCRIBE
 # ============================================================
 
 def salvar_wav(frames: list[bytes]) -> tuple[str, int]:
@@ -112,25 +238,76 @@ def salvar_wav(frames: list[bytes]) -> tuple[str, int]:
     return temp_path, duration_ms
 
 
-def transcrever_arquivo(model: WhisperModel, audio_path: str, language: str, beam_size: int) -> str:
-    segments, _info = model.transcribe(
-        audio_path,
-        language=language,
-        beam_size=beam_size,
-        vad_filter=True,
-        condition_on_previous_text=False,
-    )
-    texto = " ".join(seg.text.strip() for seg in segments if seg.text and seg.text.strip())
-    return " ".join(texto.split())
+def montar_body(audio_path: str, duration_ms: int) -> tuple[bytes, str]:
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+    body += b"Content-Type: audio/wav\r\n\r\n"
+    body += audio_bytes
+    body += f"\r\n--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="duration_ms"\r\n\r\n'
+    body += f"{int(duration_ms)}\r\n".encode()
+    body += f"--{boundary}--\r\n".encode()
+    return body, boundary
+
+
+def limpar_texto_resposta(data: Any) -> str:
+    if isinstance(data, dict):
+        texto = data.get("text") or data.get("transcript") or ""
+    else:
+        texto = str(data)
+    return " ".join(texto.strip().split())
+
+
+def transcrever_arquivo(audio_path: str, duration_ms: int, token_data: dict[str, str]) -> tuple[str, int, int, str]:
+    body, boundary = montar_body(audio_path, duration_ms)
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Authorization": token_data["authorization"],
+        "Content-Type": "multipart/form-data; boundary=" + boundary,
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "oai-language": token_data.get("oai-language", "pt-BR"),
+    }
+
+    if token_data.get("cookie"):
+        headers["Cookie"] = token_data["cookie"]
+    if token_data.get("chatgpt-account-id"):
+        headers["chatgpt-account-id"] = token_data["chatgpt-account-id"]
+    if token_data.get("oai-device-id"):
+        headers["oai-device-id"] = token_data["oai-device-id"]
+
+    t0 = time.perf_counter()
+    resp = cf_requests.post(URL, headers=headers, data=body, impersonate="chrome", timeout=120)
+    t1 = time.perf_counter()
+    elapsed_ms = int((t1 - t0) * 1000)
+
+    raw = resp.text[:600]
+    if resp.status_code == 200:
+        try:
+            texto = limpar_texto_resposta(resp.json())
+        except Exception:
+            texto = resp.text.strip()
+        return texto, resp.status_code, elapsed_ms, raw
+
+    return f"[Erro {resp.status_code}] {resp.text[:400]}", resp.status_code, elapsed_ms, raw
 
 
 def transcription_worker(
     turn_queue: queue.Queue[Turn | None],
+    token_data: dict[str, str],
     store: TranscriptStore,
     stop_event: threading.Event,
-    model: WhisperModel,
-    language: str,
-    beam_size: int,
+    show_raw: bool,
 ) -> None:
     while not stop_event.is_set() or not turn_queue.empty():
         try:
@@ -147,22 +324,24 @@ def transcription_worker(
             wav_path, duration_ms = salvar_wav(turn.frames)
             qsize = turn_queue.qsize()
             print(
-                f"\n[turno {turn.idx}] transcrevendo local dur={duration_ms}ms "
+                f"\n[turno {turn.idx}] transcrevendo dur={duration_ms}ms "
                 f"fala={turn.speech_ms}ms avg={turn.avg} peak={turn.peak} fila={qsize}",
                 flush=True,
             )
-
-            t0 = time.perf_counter()
-            texto = transcrever_arquivo(model, wav_path, language, beam_size)
-            latency_ms = int((time.perf_counter() - t0) * 1000)
+            texto, status, latency_ms, raw = transcrever_arquivo(wav_path, duration_ms, token_data)
             ratio = latency_ms / max(1, duration_ms)
 
-            if texto:
+            if status == 200 and texto:
                 print(f"[turno {turn.idx}] {texto}", flush=True)
-                print(f"[local] {latency_ms}ms audio={duration_ms}ms ratio={ratio:.2f}x", flush=True)
+                print(f"[http] {latency_ms}ms audio={duration_ms}ms ratio={ratio:.2f}x", flush=True)
                 store.append(texto)
-            else:
+            elif status == 200:
                 print(f"[turno {turn.idx}] sem texto", flush=True)
+            else:
+                print(f"[turno {turn.idx}] erro: {texto}", flush=True)
+
+            if show_raw:
+                print(f"[raw {turn.idx}] {raw[:600]}", flush=True)
         except Exception as exc:
             print(f"\n[worker erro turno {turn.idx}] {exc}", flush=True)
         finally:
@@ -184,13 +363,11 @@ def audio_callback(indata, frames, time_info, status, audio_queue: queue.Queue[b
     try:
         audio_queue.put_nowait(bytes(indata))
     except queue.Full:
+        # Se isso acontecer, o processamento local travou. Evita bloquear callback de audio.
         pass
 
 
-def run_capture(args: argparse.Namespace) -> None:
-    print("Carregando modelo Whisper local...")
-    model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
-
+def run_capture(args: argparse.Namespace, token_data: dict[str, str]) -> None:
     frame_samples = int(SAMPLE_RATE * FRAME_MS / 1000)
     audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=args.audio_queue_size)
     turn_queue: queue.Queue[Turn | None] = queue.Queue()
@@ -199,13 +376,14 @@ def run_capture(args: argparse.Namespace) -> None:
 
     worker = threading.Thread(
         target=transcription_worker,
-        args=(turn_queue, store, stop_event, model, args.language, args.beam_size),
+        args=(turn_queue, token_data, store, stop_event, args.raw),
         daemon=True,
     )
     worker.start()
 
     pre_roll_count = max(1, int(args.pre_roll_ms / FRAME_MS))
     silence_frames_limit = max(1, int(args.silence_ms / FRAME_MS))
+    min_frames = max(1, int(args.min_ms / FRAME_MS))
     max_turn_frames = None
     if args.max_turn_seconds and args.max_turn_seconds > 0:
         max_turn_frames = max(1, int(args.max_turn_seconds * 1000 / FRAME_MS))
@@ -226,11 +404,11 @@ def run_capture(args: argparse.Namespace) -> None:
     silence_count = 0
     speech_frames = 0
     voice_run = 0
+    closed_count = 0
     dropped_short = 0
     discard_cooldown_frames = 0
 
-    print("STT CONFIG OK iniciado. modo=local sem API key/cookie")
-    print(f"modelo={args.model} device={args.device} compute_type={args.compute_type}")
+    print("STT CONFIG OK iniciado.")
     max_info = "desligado" if not args.max_turn_seconds or args.max_turn_seconds <= 0 else f"{args.max_turn_seconds}s"
     print(f"threshold={threshold}, continue={continue_threshold}, silence={args.silence_ms}ms, pre_roll={args.pre_roll_ms}ms")
     print(f"continue_required={args.continue_required_ms}ms, min_speech={args.min_speech_ms}ms, max_turn={max_info}")
@@ -256,6 +434,7 @@ def run_capture(args: argparse.Namespace) -> None:
                     if in_discard_cooldown:
                         discard_cooldown_frames -= 1
 
+                    # Por padrao, threshold fixo. Se usar --adaptive, ele so aumenta ate o maximo configurado.
                     if args.adaptive:
                         noise_avg = int(sum(noise_values) / max(1, len(noise_values)))
                         adaptive_thr = int(noise_avg * args.threshold_mult)
@@ -294,6 +473,9 @@ def run_capture(args: argparse.Namespace) -> None:
                 frames.append(frame)
                 is_speech_raw = volume >= continue_threshold
 
+                # Anti-teclado / anti-clique:
+                # pico isolado acima do threshold NAO zera o silencio.
+                # So continua a fala depois de alguns frames consecutivos.
                 if is_speech_raw:
                     voice_run += 1
                 else:
@@ -323,6 +505,7 @@ def run_capture(args: argparse.Namespace) -> None:
                 if should_close_silence or should_close_max:
                     reason = "silencio" if should_close_silence else "max_turn_seconds"
                     avg, peak = stats(frames)
+                    closed_count += 1
 
                     if duration_ms < args.min_ms or speech_ms < args.min_speech_ms:
                         dropped_short += 1
@@ -350,6 +533,7 @@ def run_capture(args: argparse.Namespace) -> None:
                             flush=True,
                         )
 
+                    # Volta para IDLE sem parar o stream. O pre_roll continua recebendo frames.
                     recording = False
                     frames = []
                     silence_count = 0
@@ -375,28 +559,24 @@ def run_capture(args: argparse.Namespace) -> None:
 # ============================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="STT CONFIG OK local: microfone sempre ouvindo, transcricao em fila, sem API key e sem cookie.")
-    p.add_argument("--model", default="base", help="Modelo faster-whisper: tiny, base, small, medium, large-v3 etc.")
-    p.add_argument("--device", default="cpu", help="cpu ou cuda.")
-    p.add_argument("--compute-type", default="int8", help="int8 para CPU; float16 costuma ser bom em CUDA.")
-    p.add_argument("--language", default="pt", help="Idioma para Whisper. Use pt para portugues.")
-    p.add_argument("--beam-size", type=int, default=1, help="Beam size. 1 e mais rapido; 5 e mais preciso.")
-
+    p = argparse.ArgumentParser(description="STT CONFIG OK: continuo por turnos com configuracao aprovada: microfone sempre ouvindo, transcricao em fila.")
     p.add_argument("--threshold", type=int, default=260, help="Threshold fixo para iniciar fala. Teste 260 ou 360.")
-    p.add_argument("--continue-threshold", type=int, default=220, help="Threshold para continuar fala durante o turno.")
-    p.add_argument("--silence-ms", type=int, default=800, help="Silencio para fechar turno.")
+    p.add_argument("--continue-threshold", type=int, default=220, help="Threshold para continuar fala durante o turno. Config OK usa 220 para nao perder fala curta.")
+    p.add_argument("--silence-ms", type=int, default=800, help="Silencio para fechar turno. Config OK usa 800ms.")
     p.add_argument("--pre-roll-ms", type=int, default=600, help="Audio antes do gatilho para nao comer comeco.")
-    p.add_argument("--start-required-ms", type=int, default=80, help="Tempo minimo acima do threshold para iniciar.")
+    p.add_argument("--start-required-ms", type=int, default=80, help="Tempo minimo acima do threshold para iniciar. Config OK usa 80ms para pegar fala curta.")
     p.add_argument("--min-ms", type=int, default=700, help="Duracao minima do turno para enviar.")
-    p.add_argument("--min-speech-ms", type=int, default=250, help="Tempo minimo real de voz dentro do turno.")
-    p.add_argument("--max-turn-seconds", type=float, default=0.0, help="Fecha por tempo maximo. 0 = desligado.")
-    p.add_argument("--continue-required-ms", type=int, default=90, help="Tempo acima do continue-threshold para contar como fala real.")
-    p.add_argument("--discard-cooldown-ms", type=int, default=250, help="Cooldown depois de descartar ruido curto.")
+    p.add_argument("--min-speech-ms", type=int, default=250, help="Tempo minimo real de voz dentro do turno. Config OK usa 250ms para aceitar falas curtas.")
+    p.add_argument("--max-turn-seconds", type=float, default=0.0, help="Fecha por tempo maximo. Padrao 0 = desligado, para nao cortar frase no meio.")
+    p.add_argument("--continue-required-ms", type=int, default=90, help="Tempo acima do continue-threshold para contar como fala real. Config OK usa 90ms.")
+    p.add_argument("--discard-cooldown-ms", type=int, default=250, help="Depois de descartar ruido curto, ignora novos gatilhos por esse tempo, sem parar o microfone. Config OK usa 250ms.")
     p.add_argument("--output", default=OUTPUT_FILE, help="Arquivo de saida acumulada.")
     p.add_argument("--meter", action="store_true", default=True, help="Mostra medidor de volume.")
     p.add_argument("--no-meter", dest="meter", action="store_false", help="Desliga medidor de volume.")
+    p.add_argument("--raw", action="store_true", help="Mostra resposta raw curta da API.")
     p.add_argument("--audio-queue-size", type=int, default=5000, help="Buffer interno do microfone em frames.")
 
+    # Modo adaptativo opcional, mas limitado para nao repetir a tragedia do thr=1800.
     p.add_argument("--adaptive", action="store_true", help="Usa threshold adaptativo limitado por threshold-cap.")
     p.add_argument("--threshold-mult", type=float, default=1.4, help="Multiplicador do ruido no modo adaptive.")
     p.add_argument("--threshold-cap", type=int, default=420, help="Maximo permitido para threshold adaptativo.")
@@ -406,8 +586,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    token_data = garantir_token()
+    if not token_data:
+        return
     args = parse_args()
-    run_capture(args)
+    run_capture(args, token_data)
 
 
 if __name__ == "__main__":
