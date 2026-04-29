@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets / browser session data
+token.txt
+*.har
+*.cookie
+*.cookies
+.env
+
+# Runtime output
+transcricao.txt
+*.wav
+*.webm
+*.mp3
